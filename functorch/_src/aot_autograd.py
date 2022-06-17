@@ -107,7 +107,7 @@ def _reshape_alias(x, shape, strides):
 
 
 def create_aot_autograd_function(
-    flat_fn, fw_compiler, bw_compiler, partition_fn, decompositions, grad_state
+    flat_fn, fw_compiler, bw_compiler, partition_fn, decompositions, grad_state, out_instance=None
 ):
     """
     Traces the forward and backward graphs of the attr:`flat_fn` to generate a
@@ -132,11 +132,15 @@ def create_aot_autograd_function(
         def forward(ctx, *flat_tensor_args):
             nonlocal compiled_fw, compiled_bw, num_outs
             if compiled_fw is None:
-                with torch.set_grad_enabled(grad_state):
-                    out = flat_fn(*flat_tensor_args)
-                out = pytree.tree_map(
-                    lambda x: x.detach() if isinstance(x, Tensor) else x, out
-                )
+                # set out_instance to avoid forward here (in order to support tracing meta module)
+                if out_instance is None:
+                    with torch.set_grad_enabled(grad_state):
+                        out = flat_fn(*flat_tensor_args)
+                    out = pytree.tree_map(
+                        lambda x: x.detach() if isinstance(x, Tensor) else x, out
+                    )
+                else:
+                    out = out_instance
 
                 if isinstance(out, (list, tuple)):
                     num_outs = len(out)
@@ -150,9 +154,12 @@ def create_aot_autograd_function(
                         *joint_inputs
                     )
                 fw_module, bw_module = partition_fn(fx_g, joint_inputs)
-                # print(fw_module.code, bw_module.code)
 
+                # compiled_fw will be distributed fx graph                
                 compiled_fw = fw_compiler(fw_module, flat_tensor_args)
+
+                # (TODO) meta module will materialize here
+
                 fw_outs = normalize_as_list(compiled_fw(*flat_tensor_args))
 
                 bw_args = fw_outs[num_outs:] + fw_outs[0:num_outs]
@@ -270,6 +277,7 @@ def aot_function(
     decompositions: Dict = {},
     hasher_type: str = "StaticShapeHasher",
     static_argnums: Optional[Tuple[int]] = None,
+    out_instance = None,
 ) -> Callable:
     """
     Traces the forward and backward graph of :attr:`fn` using torch dispatch
@@ -441,6 +449,7 @@ def aot_function(
                 partition_fn,
                 decompositions,
                 grad_state=torch.is_grad_enabled(),
+                out_instance=out_instance
             ).apply
             cached_res = (compiled_fn, out_spec)
 

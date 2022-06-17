@@ -16,7 +16,7 @@ from contextlib import contextmanager
 aten = torch.ops.aten
 
 CURRENT_DECOMPOSITION_TABLE = {}
-USE_META = False
+USE_META = True
 
 
 @contextmanager
@@ -105,7 +105,7 @@ class PythonTensor(torch.Tensor):
         input_devices = [i.device for i in pytree.tree_flatten(args)[0] +
                          pytree.tree_flatten(kwargs)[0] if isinstance(i, torch.Tensor)]
 
-        output_device = get_output_device(input_devices, func)
+        output_device = "cuda:0" # get_output_device(input_devices, func)
 
         proxy_args = pytree.tree_map(unwrap_proxy, args)
         proxy_kwargs = pytree.tree_map(unwrap_proxy, kwargs)
@@ -119,7 +119,8 @@ class PythonTensor(torch.Tensor):
 
         try:
             real_out = func(*args, **kwargs)
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
+            print("fallback: ", func.__name__)
             args = pytree.tree_map(lambda x: torch.ones_like(x, device=output_device)
                                    if isinstance(x, torch.Tensor) else x, args)
             kwargs = pytree.tree_map(lambda x: torch.ones_like(x, device=output_device)
