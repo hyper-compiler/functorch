@@ -64,9 +64,24 @@ def _extract_graph_with_inputs_outputs(joint_graph, inputs, outputs):
             output_values.append(x)
     new_graph.output(output_values)
 
+    # for native_dropout and max_pool2d_with_indices we need to save mask(indice) for backward
+    need_info_bwd_ops = [ 'max_pool2d_with_indices', 'native_dropout', 'cudnn_batch_norm', 'native_layer_norm' ]
+    need_info_node = []
+    for node in new_graph.nodes:
+        if node.op == 'call_function':
+            if node.target.__name__ in need_info_bwd_ops:
+                need_info_node.append(node)
+
+    save_extra = []
+    for node in new_graph.nodes:
+        if node.op == 'call_function':
+            if node.target.__name__ in 'getitem':
+                if node.args[0] in need_info_node and node.args[1] != 0:
+                    save_extra.append(node)
+
     new_graph.eliminate_dead_code()
     new_graph.lint()
-    return new_graph
+    return new_graph, save_extra
 
 
 def _is_primal(node):
@@ -90,8 +105,8 @@ def _extract_fwd_bwd_modules(joint_module: fx.GraphModule, saved_values):
     primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
     tangent_inputs = list(filter(_is_tangent, joint_module.graph.nodes))
     # Construct the forward module
-    fwd_graph = _extract_graph_with_inputs_outputs(joint_module.graph, primal_inputs, fwd_outputs + saved_values)
-    bwd_graph = _extract_graph_with_inputs_outputs(joint_module.graph, saved_values + tangent_inputs, bwd_outputs)
+    fwd_graph, _ = _extract_graph_with_inputs_outputs(joint_module.graph, primal_inputs, fwd_outputs + saved_values)
+    bwd_graph, _ = _extract_graph_with_inputs_outputs(joint_module.graph, saved_values + tangent_inputs, bwd_outputs)
 
     # This is to filter out saved values that don't actually end up being used by the backwards pass
     for node in bwd_graph.nodes:
@@ -103,8 +118,8 @@ def _extract_fwd_bwd_modules(joint_module: fx.GraphModule, saved_values):
 
     # Now, we re-generate the fwd/bwd graphs.
     # NB: This might increase compilation time, but I doubt it matters
-    fwd_graph = _extract_graph_with_inputs_outputs(joint_module.graph, primal_inputs, fwd_outputs + saved_values)
-    bwd_graph = _extract_graph_with_inputs_outputs(joint_module.graph, saved_values + tangent_inputs, bwd_outputs)
+    fwd_graph, _ = _extract_graph_with_inputs_outputs(joint_module.graph, primal_inputs, fwd_outputs + saved_values)
+    bwd_graph, _ = _extract_graph_with_inputs_outputs(joint_module.graph, saved_values + tangent_inputs, bwd_outputs)
 
     fwd_module = fx.GraphModule(joint_module, fwd_graph)
     bwd_module = fx.GraphModule(joint_module, bwd_graph)
@@ -139,8 +154,11 @@ def default_partition(
     """
     primal_inputs = list(filter(_is_primal, joint_module.graph.nodes))
     fwd_outputs, bwd_outputs = _extract_fwd_bwd_outputs(joint_module)
-    forward_only_graph = _extract_graph_with_inputs_outputs(joint_module.graph, primal_inputs, fwd_outputs)
-    forward_node_names = set([node.name for node in forward_only_graph.nodes if node.op != 'output'])
+    forward_only_graph, save_extra = _extract_graph_with_inputs_outputs(
+        joint_module.graph, primal_inputs, fwd_outputs)
+    forward_node_names = set(
+        [node.name for node in forward_only_graph.nodes if node.op != 'output'] +
+        [node.name for node in save_extra])
 
     def node_saved(node):
         return node.name in forward_node_names and 'tensor_meta' in node.meta
